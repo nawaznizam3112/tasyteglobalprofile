@@ -1,106 +1,135 @@
 import os
 import re
 import json
+import time
 import hashlib
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import requests
-from bs4 import BeautifulSoup
 import streamlit as st
 
+from bs4 import BeautifulSoup
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
 
 # ============================================================
-# APP CONFIG
+# CONFIG
+# ============================================================
+
+APP_NAME = "MasalaAtlas AI"
+
+MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.8-flash",
+)
+
+MAX_RESEARCH_SOURCES = 12
+MAX_RECIPES_TO_EXTRACT = 7
+REQUEST_TIMEOUT = 18
+MAX_PAGE_CHARS = 24000
+
+
+# ============================================================
+# STREAMLIT CONFIG
 # ============================================================
 
 st.set_page_config(
-    page_title="MasalaAtlas AI",
+    page_title=APP_NAME,
     page_icon="🌶️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-APP_NAME = "MasalaAtlas AI"
-
-# You can change this to another available Gemini model.
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
-
 
 # ============================================================
-# CUSTOM CSS
+# CSS
 # ============================================================
 
 st.markdown(
     """
 <style>
-    .main {
+
+    .stApp {
         background: #faf8f3;
     }
 
     .hero {
-        padding: 1.5rem 1.5rem 1rem 1.5rem;
-        border-radius: 18px;
+        padding: 2rem;
+        border-radius: 22px;
         background:
             linear-gradient(
                 135deg,
-                rgba(255, 153, 51, 0.16),
-                rgba(210, 45, 45, 0.08)
+                rgba(255, 153, 51, .20),
+                rgba(210, 40, 40, .08),
+                rgba(255, 220, 120, .12)
             );
-        border: 1px solid rgba(150, 80, 20, 0.15);
-        margin-bottom: 1rem;
+        border: 1px solid rgba(120, 70, 20, .14);
+        margin-bottom: 1.5rem;
     }
 
     .hero h1 {
-        margin-bottom: 0.2rem;
+        font-size: 2.6rem;
+        margin-bottom: .2rem;
+    }
+
+    .hero p {
+        font-size: 1.05rem;
+        color: #665b50;
     }
 
     .recipe-card {
-        padding: 1rem;
-        border-radius: 14px;
-        border: 1px solid #e5ded1;
         background: white;
+        padding: 1.3rem;
+        border-radius: 16px;
+        border: 1px solid #e7dfd2;
         margin-bottom: 1rem;
     }
 
-    .metric-card {
+    .source-card {
+        background: #fff;
         padding: 1rem;
         border-radius: 12px;
-        background: white;
-        border: 1px solid #e5ded1;
-        text-align: center;
+        border: 1px solid #e7dfd2;
+        margin-bottom: .7rem;
+    }
+
+    .score {
+        font-size: 1.7rem;
+        font-weight: 700;
     }
 
     .small {
-        color: #6b6258;
-        font-size: 0.88rem;
+        color: #766c62;
+        font-size: .85rem;
     }
 
-    .tag {
+    .pill {
         display: inline-block;
-        padding: 0.25rem 0.55rem;
-        margin-right: 0.3rem;
-        border-radius: 999px;
-        background: #f2eadf;
-        font-size: 0.78rem;
+        padding: .25rem .65rem;
+        border-radius: 100px;
+        background: #f0e8dc;
+        margin-right: .25rem;
+        margin-bottom: .25rem;
+        font-size: .78rem;
     }
 
-    .warning {
-        padding: 0.8rem;
-        background: #fff4d6;
-        border-radius: 10px;
-        border-left: 4px solid #d99a00;
+    .success-box {
+        background: #edf8ef;
+        border-left: 4px solid #2e8b57;
+        padding: 1rem;
+        border-radius: 8px;
     }
 
-    .success {
-        padding: 0.8rem;
-        background: #eaf7ed;
-        border-radius: 10px;
-        border-left: 4px solid #31914b;
+    .warning-box {
+        background: #fff5d8;
+        border-left: 4px solid #d59b00;
+        padding: 1rem;
+        border-radius: 8px;
     }
+
 </style>
 """,
     unsafe_allow_html=True,
@@ -108,436 +137,1121 @@ st.markdown(
 
 
 # ============================================================
-# PYDANTIC MODELS
+# DATA MODELS
 # ============================================================
+
+class ResearchSource(BaseModel):
+    title: str = ""
+    url: str = ""
+    country: str = ""
+    region: str = ""
+    cuisine: str = ""
+    dish: str = ""
+
+    why_relevant: str = ""
+    source_quality: int = Field(default=5, ge=0, le=10)
+    recipe_completeness: int = Field(default=5, ge=0, le=10)
+    regional_authenticity: int = Field(default=5, ge=0, le=10)
+    indian_adaptation_potential: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+    )
+
+
+class ResearchResult(BaseModel):
+    search_summary: str = ""
+    sources: List[ResearchSource] = Field(
+        default_factory=list
+    )
+
 
 class Ingredient(BaseModel):
     name: str
     quantity: str
-    notes: Optional[str] = ""
+    notes: str = ""
 
 
 class Recipe(BaseModel):
-    title: str
-    source_url: Optional[str] = ""
-    source_country: Optional[str] = ""
-    source_region: Optional[str] = ""
+    title: str = ""
+
+    source_url: str = ""
+    source_title: str = ""
+
+    country: str = ""
+    region: str = ""
+    cuisine: str = ""
 
     description: str = ""
 
-    cuisine: str = ""
-    dish_type: str = ""
+    ingredients: List[Ingredient] = Field(
+        default_factory=list
+    )
 
-    ingredients: List[Ingredient] = Field(default_factory=list)
-    instructions: List[str] = Field(default_factory=list)
+    instructions: List[str] = Field(
+        default_factory=list
+    )
 
     prep_time_minutes: int = 0
     cook_time_minutes: int = 0
     servings: int = 1
 
-    dietary_tags: List[str] = Field(default_factory=list)
-    allergens: List[str] = Field(default_factory=list)
+    dietary_tags: List[str] = Field(
+        default_factory=list
+    )
+
+    allergens: List[str] = Field(
+        default_factory=list
+    )
 
 
-class AdaptedRecipe(Recipe):
+class AdaptedRecipe(BaseModel):
+    original_title: str = ""
     indian_name: str = ""
 
+    source_url: str = ""
+
+    original_country: str = ""
+    original_region: str = ""
+
     target_indian_region: str = ""
+
     flavour_profile: str = ""
 
-    spice_level: int = 5
-    tanginess: int = 5
-    sweetness: int = 3
-    saltiness: int = 5
-    richness: int = 5
-    smokiness: int = 3
+    description: str = ""
 
-    street_food_score: int = 0
-    commercial_score: int = 0
+    ingredients: List[Ingredient] = Field(
+        default_factory=list
+    )
 
-    indian_adaptation_notes: List[str] = Field(default_factory=list)
-    substitutions: List[str] = Field(default_factory=list)
+    instructions: List[str] = Field(
+        default_factory=list
+    )
 
-    plating_and_serving: List[str] = Field(default_factory=list)
-    batch_production_notes: List[str] = Field(default_factory=list)
+    accompaniments: List[str] = Field(
+        default_factory=list
+    )
 
-    estimated_food_cost_inr: Optional[float] = None
-    suggested_selling_price_inr: Optional[float] = None
+    substitutions: List[str] = Field(
+        default_factory=list
+    )
+
+    adaptation_notes: List[str] = Field(
+        default_factory=list
+    )
+
+    batch_production_notes: List[str] = Field(
+        default_factory=list
+    )
+
+    prep_time_minutes: int = 0
+    cook_time_minutes: int = 0
+    servings: int = 1
+
+    spice_level: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+    )
+
+    tanginess: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+    )
+
+    sweetness: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+    )
+
+    saltiness: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+    )
+
+    richness: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+    )
+
+    smokiness: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+    )
+
+    street_food_score: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+    )
+
+    commercial_score: int = Field(
+        default=5,
+        ge=0,
+        le=10,
+    )
+
+    estimated_food_cost_inr: float = 0
+
+    suggested_selling_price_inr: float = 0
+
+    menu_positioning: str = ""
+
+
+class GenerationResult(BaseModel):
+    research_summary: str = ""
+
+    recipes: List[AdaptedRecipe] = Field(
+        default_factory=list
+    )
 
 
 # ============================================================
-# GEMINI CLIENT
+# API
 # ============================================================
 
 @st.cache_resource
 def get_gemini_client():
+
     api_key = None
 
     try:
-        api_key = st.secrets.get("GEMINI_API_KEY")
+        api_key = st.secrets.get(
+            "GEMINI_API_KEY"
+        )
     except Exception:
         pass
 
     if not api_key:
-        api_key = os.getenv("GEMINI_API_KEY")
+        api_key = os.getenv(
+            "GEMINI_API_KEY"
+        )
 
     if not api_key:
         return None
 
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key
+    )
 
 
-def gemini_available():
+def gemini_ready():
+
     return get_gemini_client() is not None
 
 
 # ============================================================
-# UTILITIES
+# TEXT HELPERS
 # ============================================================
 
-def clean_text(text: str, max_chars: int = 18000) -> str:
-    text = re.sub(r"\s+", " ", text or "").strip()
-    return text[:max_chars]
-
-
-def hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode("utf-8")).hexdigest()
-
-
-def extract_json(text: str):
-    """
-    Defensive JSON extraction in case a model returns markdown fences.
-    """
-    text = text.strip()
+def clean_text(
+    text: str,
+    max_chars: int = MAX_PAGE_CHARS,
+):
 
     text = re.sub(
-        r"^```(?:json)?",
-        "",
-        text,
-        flags=re.IGNORECASE,
+        r"\s+",
+        " ",
+        text or "",
     )
 
-    text = re.sub(r"```$", "", text).strip()
+    return text.strip()[:max_chars]
+
+
+def normalize_url(url: str):
+
+    if not url:
+        return ""
+
+    url = url.strip()
+
+    if not url.startswith(
+        ("http://", "https://")
+    ):
+        return ""
+
+    parsed = urlparse(url)
+
+    if not parsed.netloc:
+        return ""
+
+    return url
+
+
+def domain(url: str):
 
     try:
-        return json.loads(text)
+        return urlparse(url).netloc.lower()
     except Exception:
-        pass
+        return ""
 
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
 
-    if match:
-        return json.loads(match.group(0))
+def url_hash(url: str):
 
-    raise ValueError("Could not extract JSON from Gemini response.")
+    return hashlib.sha256(
+        url.encode("utf-8")
+    ).hexdigest()
 
 
 # ============================================================
-# WEB SCRAPER
+# WEB PAGE FETCHING
 # ============================================================
 
-def scrape_recipe_url(url: str):
+@st.cache_data(
+    ttl=60 * 60 * 24,
+    show_spinner=False,
+)
+def fetch_webpage(url: str):
+
     headers = {
         "User-Agent": (
             "Mozilla/5.0 "
             "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
-            "Chrome/125.0 Safari/537.36"
+            "(KHTML, like Gecko) "
+            "Chrome/131.0 Safari/537.36"
+        ),
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,*/*;q=0.8"
+        ),
+    }
+
+    try:
+
+        response = requests.get(
+            url,
+            headers=headers,
+            timeout=REQUEST_TIMEOUT,
+            allow_redirects=True,
         )
-    }
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=20,
-    )
+        response.raise_for_status()
 
-    response.raise_for_status()
+        content_type = response.headers.get(
+            "content-type",
+            "",
+        ).lower()
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser",
-    )
+        if (
+            "text/html" not in content_type
+            and "application/xhtml" not in content_type
+        ):
+            return {
+                "ok": False,
+                "url": url,
+                "error": "Not an HTML page.",
+            }
 
-    # Remove noisy elements.
-    for element in soup(
-        ["script", "style", "noscript", "svg", "nav", "footer"]
-    ):
-        element.decompose()
+        html = response.text
 
-    # First preference: JSON-LD recipe schema.
-    jsonld_recipes = []
+        soup = BeautifulSoup(
+            html,
+            "html.parser",
+        )
 
-    for script in soup.find_all(
-        "script",
-        type="application/ld+json",
-    ):
-        try:
-            data = json.loads(script.string or script.get_text())
-        except Exception:
-            continue
+        for tag in soup(
+            [
+                "script",
+                "style",
+                "noscript",
+                "svg",
+                "nav",
+                "footer",
+                "header",
+                "aside",
+            ]
+        ):
+            tag.decompose()
 
-        if isinstance(data, dict):
-            if data.get("@type") == "Recipe":
-                jsonld_recipes.append(data)
+        title = ""
 
-            elif "@graph" in data:
-                for item in data["@graph"]:
-                    if (
-                        isinstance(item, dict)
-                        and item.get("@type") == "Recipe"
-                    ):
-                        jsonld_recipes.append(item)
+        if soup.title:
+            title = soup.title.get_text(
+                " ",
+                strip=True,
+            )
 
-        elif isinstance(data, list):
-            for item in data:
-                if (
-                    isinstance(item, dict)
-                    and item.get("@type") == "Recipe"
-                ):
-                    jsonld_recipes.append(item)
+        visible_text = clean_text(
+            soup.get_text(
+                " ",
+                strip=True,
+            )
+        )
 
-    text = clean_text(soup.get_text(" ", strip=True))
+        jsonld = []
 
-    return {
-        "url": url,
-        "title": soup.title.get_text(strip=True)
-        if soup.title
-        else "",
-        "jsonld": jsonld_recipes,
-        "page_text": text,
-    }
+        original_soup = BeautifulSoup(
+            html,
+            "html.parser",
+        )
+
+        for script in original_soup.find_all(
+            "script",
+            type="application/ld+json",
+        ):
+
+            raw = script.string or script.get_text()
+
+            try:
+
+                data = json.loads(raw)
+
+                if isinstance(data, list):
+                    jsonld.extend(data)
+
+                else:
+                    jsonld.append(data)
+
+            except Exception:
+                continue
+
+        return {
+            "ok": True,
+            "url": response.url,
+            "title": title,
+            "text": visible_text,
+            "jsonld": jsonld,
+        }
+
+    except Exception as e:
+
+        return {
+            "ok": False,
+            "url": url,
+            "error": str(e),
+        }
 
 
 # ============================================================
-# GEMINI RECIPE EXTRACTION
+# GEMINI RESEARCH
 # ============================================================
 
-def extract_recipe_with_ai(scraped):
+def research_sources(
+    country,
+    region,
+    category,
+    target_indian_region,
+):
+
     client = get_gemini_client()
 
     if not client:
         raise RuntimeError(
-            "Gemini API key not configured."
+            "GEMINI_API_KEY is not configured."
         )
 
-    jsonld = json.dumps(
-        scraped["jsonld"],
-        ensure_ascii=False,
+    prompt = f"""
+You are the global culinary research agent for
+a restaurant R&D company.
+
+Your job is to research real recipes on the public web.
+
+RESEARCH TARGET
+
+Country:
+{country}
+
+Region:
+{region}
+
+Food category:
+{category}
+
+Target Indian market:
+{target_indian_region}
+
+Find strong recipe sources that can be used as
+research material for developing Indian street food.
+
+Search broadly across the public web.
+
+PRIORITIZE:
+
+1. Regional food experts.
+2. Established recipe publishers.
+3. Chefs.
+4. Food magazines.
+5. Culinary institutions.
+6. Local/regional food sites.
+7. High-quality independent food writers.
+
+Prefer recipes that have:
+
+- actual ingredient lists
+- measurable quantities
+- clear preparation
+- regional context
+- identifiable culinary tradition
+- useful cooking techniques
+- useful flavour structure
+- potential for adaptation
+
+AVOID:
+
+- SEO spam
+- recipe aggregators
+- duplicate recipes
+- pages without recipes
+- obvious AI-generated content
+- pages that only contain snippets
+- inaccessible/login-only pages
+- pages with no meaningful recipe information
+
+Do not invent URLs.
+
+Return real URLs discovered through web search.
+
+The purpose is NOT to copy recipes verbatim.
+
+We are using these sources for culinary research
+and then creating an original Indian adaptation.
+
+Find approximately 10-12 strong candidates.
+
+For each candidate evaluate:
+
+- source quality
+- recipe completeness
+- regional authenticity
+- Indian adaptation potential
+- why it is interesting
+
+Be particularly interested in recipes that could become
+street-food products.
+"""
+
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            tools=[
+                types.Tool(
+                    google_search=types.GoogleSearch()
+                )
+            ],
+            response_mime_type="application/json",
+            response_schema=ResearchResult,
+            temperature=0.25,
+        ),
     )
+
+    if getattr(
+        response,
+        "parsed",
+        None,
+    ):
+
+        return response.parsed
+
+    return ResearchResult.model_validate_json(
+        response.text
+    )
+
+
+# ============================================================
+# RECIPE EXTRACTION
+# ============================================================
+
+def extract_recipe(
+    page,
+    source: ResearchSource,
+):
+
+    client = get_gemini_client()
+
+    if not client:
+        raise RuntimeError(
+            "Gemini API key is not configured."
+        )
 
     prompt = f"""
 You are a professional culinary data extraction system.
 
-Extract the recipe from the supplied webpage.
+Extract the recipe from the webpage below.
 
-IMPORTANT:
-- Do not invent missing ingredients.
-- Preserve original quantities where possible.
-- If a field is unknown, leave it blank.
-- Separate ingredients from instructions.
-- Identify country/region/cuisine only when reasonably supported.
-- This is an extraction task, not an adaptation task.
+Do NOT adapt it.
+
+Do NOT Indianize it.
+
+Do NOT invent ingredients.
+
+Preserve quantities as closely as possible.
+
+If a quantity is unknown, leave it blank.
+
+SOURCE INFORMATION
+
+Title:
+{source.title}
 
 URL:
-{scraped["url"]}
+{source.url}
 
-JSON-LD recipe data:
-{jsonld[:12000]}
+Country:
+{source.country}
 
-Visible webpage text:
-{scraped["page_text"][:16000]}
+Region:
+{source.region}
+
+Cuisine:
+{source.cuisine}
+
+JSON-LD DATA:
+{json.dumps(page.get("jsonld", []), ensure_ascii=False)[:12000]}
+
+PAGE TEXT:
+{page.get("text", "")[:18000]}
+
+Return a clean structured recipe.
 """
 
     response = client.models.generate_content(
-        model=DEFAULT_MODEL,
+        model=MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=Recipe,
-            temperature=0.2,
+            temperature=0.15,
         ),
     )
 
-    if getattr(response, "parsed", None):
+    if getattr(
+        response,
+        "parsed",
+        None,
+    ):
+
         recipe = response.parsed
-        if isinstance(recipe, Recipe):
-            recipe.source_url = scraped["url"]
-            return recipe
 
-    data = extract_json(response.text)
+    else:
 
-    recipe = Recipe.model_validate(data)
-    recipe.source_url = scraped["url"]
+        recipe = Recipe.model_validate_json(
+            response.text
+        )
+
+    recipe.source_url = (
+        page.get("url")
+        or source.url
+    )
+
+    recipe.source_title = (
+        source.title
+    )
+
+    recipe.country = (
+        recipe.country
+        or source.country
+    )
+
+    recipe.region = (
+        recipe.region
+        or source.region
+    )
+
+    recipe.cuisine = (
+        recipe.cuisine
+        or source.cuisine
+    )
 
     return recipe
+
+
+# ============================================================
+# DEDUPLICATION
+# ============================================================
+
+def recipe_fingerprint(recipe):
+
+    ingredients = "|".join(
+        sorted(
+            i.name.lower().strip()
+            for i in recipe.ingredients
+        )
+    )
+
+    base = (
+        recipe.title.lower().strip()
+        + "|"
+        + ingredients
+    )
+
+    return hashlib.sha256(
+        base.encode("utf-8")
+    ).hexdigest()
+
+
+def deduplicate_recipes(
+    recipes,
+):
+
+    output = []
+    seen = set()
+
+    for recipe in recipes:
+
+        fp = recipe_fingerprint(
+            recipe
+        )
+
+        if fp not in seen:
+
+            seen.add(fp)
+            output.append(recipe)
+
+    return output
 
 
 # ============================================================
 # INDIAN ADAPTATION
 # ============================================================
 
-def build_adaptation_prompt(
-    recipe: Recipe,
-    target_region: str,
-    flavour_profile: str,
-    spice_level: int,
-    tanginess: int,
-    sweetness: int,
-    saltiness: int,
-    richness: int,
-    smokiness: int,
-    vegetarian: bool,
-    vegan: bool,
-    jain: bool,
-    street_food: bool,
+def adapt_recipes(
+    recipes,
+    target_indian_region,
+    flavour_profile,
+    spice,
+    tang,
+    sweet,
+    salt,
+    richness,
+    smoke,
+    vegetarian,
+    vegan,
+    jain,
+    street_food,
 ):
-    return f"""
-You are an expert Indian chef, food R&D consultant and restaurant
-menu developer.
 
-Your task is to transform an international recipe into an Indian
-street-food-friendly recipe.
-
-DO NOT simply add chilli powder.
-
-Think about:
-- Indian ingredient availability
-- Indian cooking techniques
-- regional flavour traditions
-- street-food eating behaviour
-- texture
-- aroma
-- chutneys
-- masalas
-- frying/grilling/tawa techniques
-- batch production
-- consistency
-- food cost
-- speed of service
-- holding quality
-
-SOURCE RECIPE:
-{recipe.model_dump_json(indent=2)}
-
-TARGET INDIAN REGION:
-{target_region}
-
-TARGET FLAVOUR PROFILE:
-{flavour_profile}
-
-ADJUSTABLE FLAVOUR LEVELS:
-Spice: {spice_level}/10
-Tanginess: {tanginess}/10
-Sweetness: {sweetness}/10
-Saltiness: {saltiness}/10
-Richness: {richness}/10
-Smokiness: {smokiness}/10
-
-DIETARY REQUIREMENTS:
-Vegetarian: {vegetarian}
-Vegan: {vegan}
-Jain: {jain}
-
-STREET FOOD CONCEPT:
-{street_food}
-
-IMPORTANT CULINARY RULES:
-
-1. Preserve the identity of the original dish where useful.
-2. Adapt intelligently to Indian taste rather than randomly
-   adding Indian ingredients.
-3. Use practical Indian ingredients.
-4. If an original ingredient is unavailable or unsuitable,
-   propose a realistic substitution.
-5. Give quantities.
-6. Make the recipe executable by a professional kitchen.
-7. Suggest sauces/chutneys/accompaniments where appropriate.
-8. Consider whether the recipe can be prepared in batches.
-9. Consider portion economics.
-10. Estimate food cost conservatively in INR.
-11. Suggest a commercially sensible selling price.
-12. Explain major adaptations.
-13. Do not claim exact authenticity unless justified.
-14. If the dish would not work well as Indian street food,
-    modify the format while preserving its core identity.
-
-The output must be a structured recipe.
-"""
-
-
-def adapt_recipe(
-    recipe: Recipe,
-    target_region: str,
-    flavour_profile: str,
-    spice_level: int,
-    tanginess: int,
-    sweetness: int,
-    saltiness: int,
-    richness: int,
-    smokiness: int,
-    vegetarian: bool,
-    vegan: bool,
-    jain: bool,
-    street_food: bool,
-):
     client = get_gemini_client()
 
     if not client:
         raise RuntimeError(
-            "Gemini API key not configured."
+            "GEMINI_API_KEY is not configured."
         )
 
-    prompt = build_adaptation_prompt(
-        recipe,
-        target_region,
-        flavour_profile,
-        spice_level,
-        tanginess,
-        sweetness,
-        saltiness,
-        richness,
-        smokiness,
-        vegetarian,
-        vegan,
-        jain,
-        street_food,
+    recipes_json = json.dumps(
+        [
+            r.model_dump()
+            for r in recipes
+        ],
+        ensure_ascii=False,
+        indent=2,
     )
 
+    prompt = f"""
+You are an expert Indian chef,
+food scientist,
+street-food entrepreneur,
+menu engineer,
+and restaurant R&D consultant.
+
+We researched international recipes.
+
+Now transform them into original Indian
+street-food products.
+
+TARGET INDIAN REGION:
+{target_indian_region}
+
+FLAVOUR PROFILE:
+{flavour_profile}
+
+FLAVOUR CONTROLS:
+
+Spice: {spice}/10
+Tanginess: {tang}/10
+Sweetness: {sweet}/10
+Saltiness: {salt}/10
+Richness: {richness}/10
+Smokiness: {smoke}/10
+
+DIETARY REQUIREMENTS:
+
+Vegetarian:
+{vegetarian}
+
+Vegan:
+{vegan}
+
+Jain:
+{jain}
+
+STREET FOOD:
+{street_food}
+
+SOURCE RECIPES:
+
+{recipes_json}
+
+CULINARY INSTRUCTIONS:
+
+Do not merely add chilli powder.
+
+Think like a professional Indian chef.
+
+Consider:
+
+- Indian flavour architecture
+- regional Indian cooking
+- ingredient availability
+- texture
+- aroma
+- spice
+- acidity
+- sweetness
+- chutneys
+- masalas
+- frying
+- tawa cooking
+- grilling
+- smoking
+- fermentation where appropriate
+- Indian street-food formats
+- speed of service
+- batch preparation
+- holding quality
+- consistency
+- portion size
+- food cost
+- customer appeal
+
+PRESERVE THE CORE IDENTITY:
+
+The adapted product should still retain
+something recognizable from the original recipe.
+
+However, it may be reformatted as:
+
+- roll
+- wrap
+- toast
+- sandwich
+- chaat
+- tikka
+- skewer
+- fried snack
+- tawa snack
+- stuffed bread
+- bowl
+- burger
+- dosa-style product
+- Indian fusion street-food item
+
+if that makes commercial sense.
+
+IMPORTANT:
+
+Do not claim authenticity when the adaptation
+is clearly fusion.
+
+Create original recipe wording.
+
+Provide practical quantities.
+
+Provide a realistic preparation method.
+
+Estimate food cost in INR for one serving.
+
+Suggest a realistic Indian street-food selling price.
+
+Score:
+
+street_food_score:
+0-10
+
+commercial_score:
+0-10
+
+Also explain why the product could work
+or fail commercially.
+
+Return the strongest adapted concepts.
+"""
+
+
     response = client.models.generate_content(
-        model=DEFAULT_MODEL,
+        model=MODEL,
         contents=prompt,
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
-            response_schema=AdaptedRecipe,
+            response_schema=GenerationResult,
             temperature=0.65,
         ),
     )
 
-    if getattr(response, "parsed", None):
+    if getattr(
+        response,
+        "parsed",
+        None,
+    ):
+
         result = response.parsed
 
-        if isinstance(result, AdaptedRecipe):
-            return result
+    else:
 
-    data = extract_json(response.text)
+        result = GenerationResult.model_validate_json(
+            response.text
+        )
 
-    return AdaptedRecipe.model_validate(data)
+    return result
 
 
 # ============================================================
-# RECIPE RANKING
+# RESEARCH PIPELINE
 # ============================================================
 
-def calculate_business_score(recipe: AdaptedRecipe):
+def run_full_pipeline(
+    country,
+    region,
+    category,
+    target_indian_region,
+    flavour_profile,
+    spice,
+    tang,
+    sweet,
+    salt,
+    richness,
+    smoke,
+    vegetarian,
+    vegan,
+    jain,
+    street_food,
+):
+
+    progress = st.progress(
+        0
+    )
+
+    status = st.empty()
+
+    # --------------------------------------------------------
+    # 1. WEB RESEARCH
+    # --------------------------------------------------------
+
+    status.info(
+        "🌍 Step 1/5 — Gemini is researching the global web..."
+    )
+
+    progress.progress(
+        10
+    )
+
+    research = research_sources(
+        country=country,
+        region=region,
+        category=category,
+        target_indian_region=target_indian_region,
+    )
+
+    sources = []
+
+    seen_urls = set()
+
+    for source in research.sources:
+
+        url = normalize_url(
+            source.url
+        )
+
+        if not url:
+            continue
+
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+
+        sources.append(
+            source
+        )
+
+    sources.sort(
+        key=lambda x: (
+            x.source_quality
+            + x.recipe_completeness
+            + x.regional_authenticity
+            + x.indian_adaptation_potential
+        ),
+        reverse=True,
+    )
+
+    sources = sources[
+        :MAX_RESEARCH_SOURCES
+    ]
+
+    # --------------------------------------------------------
+    # 2. FETCH
+    # --------------------------------------------------------
+
+    status.info(
+        f"🌐 Step 2/5 — Checking {len(sources)} recipe sources..."
+    )
+
+    progress.progress(
+        30
+    )
+
+    fetched_pages = []
+
+    for i, source in enumerate(
+        sources
+    ):
+
+        page = fetch_webpage(
+            source.url
+        )
+
+        if page.get("ok"):
+
+            fetched_pages.append(
+                (
+                    source,
+                    page,
+                )
+            )
+
+        progress.progress(
+            30
+            + int(
+                (i + 1)
+                / max(len(sources), 1)
+                * 20
+            )
+        )
+
+    # --------------------------------------------------------
+    # 3. EXTRACT RECIPES
+    # --------------------------------------------------------
+
+    status.info(
+        f"🍳 Step 3/5 — Extracting {len(fetched_pages)} recipes..."
+    )
+
+    recipes = []
+
+    for i, (
+        source,
+        page,
+    ) in enumerate(
+        fetched_pages[
+            :MAX_RECIPES_TO_EXTRACT
+        ]
+    ):
+
+        try:
+
+            recipe = extract_recipe(
+                page,
+                source,
+            )
+
+            if recipe.ingredients:
+
+                recipes.append(
+                    recipe
+                )
+
+        except Exception:
+            pass
+
+        progress.progress(
+            50
+            + int(
+                (i + 1)
+                / max(
+                    min(
+                        len(fetched_pages),
+                        MAX_RECIPES_TO_EXTRACT,
+                    ),
+                    1,
+                )
+                * 20
+            )
+        )
+
+        time.sleep(
+            0.2
+        )
+
+    recipes = deduplicate_recipes(
+        recipes
+    )
+
+    if not recipes:
+
+        raise RuntimeError(
+            "No usable recipes could be extracted "
+            "from the discovered sources."
+        )
+
+    # --------------------------------------------------------
+    # 4. INDIANIZATION
+    # --------------------------------------------------------
+
+    status.info(
+        f"🇮🇳 Step 4/5 — Creating Indian adaptations..."
+    )
+
+    progress.progress(
+        75
+    )
+
+    adapted = adapt_recipes(
+        recipes=recipes,
+        target_indian_region=target_indian_region,
+        flavour_profile=flavour_profile,
+        spice=spice,
+        tang=tang,
+        sweet=sweet,
+        salt=salt,
+        richness=richness,
+        smoke=smoke,
+        vegetarian=vegetarian,
+        vegan=vegan,
+        jain=jain,
+        street_food=street_food,
+    )
+
+    # --------------------------------------------------------
+    # 5. COMPLETE
+    # --------------------------------------------------------
+
+    progress.progress(
+        100
+    )
+
+    status.success(
+        f"✅ Research complete — "
+        f"{len(adapted.recipes)} Indian concepts created."
+    )
+
+    return (
+        research,
+        recipes,
+        adapted,
+    )
+
+
+# ============================================================
+# SCORE
+# ============================================================
+
+def business_score(
+    recipe: AdaptedRecipe
+):
+
     return round(
         (
-            recipe.street_food_score * 0.35
-            + recipe.commercial_score * 0.35
-            + (10 - recipe.richness) * 0.05
-            + recipe.spice_level * 0.05
-            + recipe.tanginess * 0.05
-            + recipe.smokiness * 0.05
+            recipe.street_food_score
+            * 0.5
+            +
+            recipe.commercial_score
+            * 0.5
         )
         * 10,
         1,
@@ -548,11 +1262,14 @@ def calculate_business_score(recipe: AdaptedRecipe):
 # SESSION STATE
 # ============================================================
 
-if "recipes" not in st.session_state:
-    st.session_state.recipes = []
+if "last_research" not in st.session_state:
+    st.session_state.last_research = None
 
-if "adapted_recipes" not in st.session_state:
-    st.session_state.adapted_recipes = []
+if "last_original_recipes" not in st.session_state:
+    st.session_state.last_original_recipes = []
+
+if "last_adapted" not in st.session_state:
+    st.session_state.last_adapted = None
 
 
 # ============================================================
@@ -560,15 +1277,15 @@ if "adapted_recipes" not in st.session_state:
 # ============================================================
 
 st.markdown(
-    """
+    f"""
 <div class="hero">
 
-# 🌶️ MasalaAtlas AI
+<h1>🌶️ {APP_NAME}</h1>
 
-### Global recipes → Indian palate → Street-food R&D
-
-Discover recipes from around the world and intelligently transform
-them into commercially useful Indian street-food concepts.
+<p>
+Global culinary research → Indian flavour intelligence
+→ street-food product development
+</p>
 
 </div>
 """,
@@ -577,26 +1294,96 @@ them into commercially useful Indian street-food concepts.
 
 
 # ============================================================
+# API CHECK
+# ============================================================
+
+if not gemini_ready():
+
+    st.warning(
+        """
+        Gemini API is not configured.
+
+        Add GEMINI_API_KEY to your environment or
+        Streamlit secrets before running research.
+        """
+    )
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 
 with st.sidebar:
 
-    st.header("⚙️ AI Kitchen Controls")
+    st.header("🌍 Research")
 
-    mode = st.radio(
-        "Mode",
+    country = st.selectbox(
+        "Country",
         [
-            "User",
-            "Admin / R&D",
+            "Mexico",
+            "Thailand",
+            "Japan",
+            "South Korea",
+            "Vietnam",
+            "Indonesia",
+            "Malaysia",
+            "China",
+            "Turkey",
+            "Lebanon",
+            "Greece",
+            "Italy",
+            "Spain",
+            "Portugal",
+            "France",
+            "United Kingdom",
+            "United States",
+            "Brazil",
+            "Argentina",
+            "Peru",
+            "Colombia",
+            "South Africa",
+            "Morocco",
+            "Egypt",
+            "Nigeria",
+            "Ethiopia",
+            "Australia",
+            "New Zealand",
+            "Other",
+        ],
+    )
+
+    region = st.text_input(
+        "Region / city / culinary area",
+        placeholder="e.g. Oaxaca",
+        value="",
+    )
+
+    category = st.selectbox(
+        "Food category",
+        [
+            "Street Food",
+            "Snacks",
+            "Breakfast",
+            "Sandwiches",
+            "Wraps",
+            "Fried Food",
+            "Grilled Food",
+            "Noodles",
+            "Rice Dishes",
+            "Dumplings",
+            "Tacos / Flatbreads",
+            "Desserts",
+            "Drinks",
+            "Sauces / Chutneys",
+            "Any",
         ],
     )
 
     st.divider()
 
-    st.subheader("🇮🇳 Indian Target")
+    st.header("🇮🇳 Indian Target")
 
-    target_region = st.selectbox(
+    target_indian_region = st.selectbox(
         "Indian region",
         [
             "Pan-India",
@@ -606,6 +1393,7 @@ with st.sidebar:
             "Rajasthan",
             "Gujarat",
             "Karnataka",
+            "Bengaluru",
             "Tamil Nadu",
             "Kerala",
             "Andhra Pradesh",
@@ -618,51 +1406,53 @@ with st.sidebar:
     )
 
     flavour_profile = st.selectbox(
-        "Flavour direction",
+        "Flavour profile",
         [
             "Classic Indian Street Food",
+            "Chatpata",
+            "Spicy & Tangy",
             "Mumbai Street Food",
             "Delhi Street Food",
             "South Indian",
-            "Indo-Chinese",
             "Punjabi",
             "Tandoori / Smoky",
-            "Chatpata",
-            "Spicy & Tangy",
+            "Indo-Chinese",
             "Sweet & Spicy",
             "Modern Indian Fusion",
             "Premium Gourmet Street Food",
         ],
     )
 
-    st.subheader("🎚️ Flavour Controls")
+    st.divider()
 
-    spice_level = st.slider(
+    st.header("🎚️ Flavour Controls")
+
+    spice = st.slider(
         "🌶️ Spice",
         0,
         10,
         6,
     )
 
-    tanginess = st.slider(
+    tang = st.slider(
         "🍋 Tanginess",
         0,
         10,
-        6,
+        7,
     )
 
-    sweetness = st.slider(
+    sweet = st.slider(
         "🍬 Sweetness",
         0,
         10,
         3,
     )
 
-    saltiness = st.slider(
+    salt = st.slider(
         "🧂 Saltiness",
         0,
         10,
-        5,
+        6,
     )
 
     richness = st.slider(
@@ -672,14 +1462,16 @@ with st.sidebar:
         5,
     )
 
-    smokiness = st.slider(
+    smoke = st.slider(
         "🔥 Smokiness",
         0,
         10,
-        4,
+        5,
     )
 
     st.divider()
+
+    st.header("🥬 Dietary")
 
     vegetarian = st.checkbox(
         "Vegetarian",
@@ -703,577 +1495,573 @@ with st.sidebar:
 
 
 # ============================================================
-# API STATUS
+# MAIN GENERATE BUTTON
 # ============================================================
 
-if not gemini_available():
-    st.warning(
-        "Gemini API key is not configured. Add GEMINI_API_KEY "
-        "to your environment or Streamlit secrets."
-    )
+st.subheader(
+    "🚀 One-click culinary research"
+)
 
+st.write(
+    """
+Select your origin cuisine and Indian target above.
+MasalaAtlas will research the web, select strong recipes,
+extract them, and create Indian street-food adaptations.
+"""
+)
 
-# ============================================================
-# TOP METRICS
-# ============================================================
-
-c1, c2, c3, c4 = st.columns(4)
-
-with c1:
-    st.metric(
-        "Recipes collected",
-        len(st.session_state.recipes),
-    )
-
-with c2:
-    st.metric(
-        "Indianized",
-        len(st.session_state.adapted_recipes),
-    )
-
-with c3:
-    st.metric(
-        "Target region",
-        target_region,
-    )
-
-with c4:
-    st.metric(
-        "AI model",
-        DEFAULT_MODEL,
-    )
-
-
-# ============================================================
-# TABS
-# ============================================================
-
-tab1, tab2, tab3, tab4 = st.tabs(
-    [
-        "🌍 Discover",
-        "🇮🇳 Indianize",
-        "📊 R&D Lab",
-        "💾 Export",
-    ]
+generate = st.button(
+    "🔎 RESEARCH & GENERATE RECIPES",
+    type="primary",
+    use_container_width=True,
 )
 
 
 # ============================================================
-# DISCOVER
+# RUN
 # ============================================================
 
-with tab1:
+if generate:
 
-    st.header("🌍 Global Recipe Discovery")
+    if not gemini_ready():
 
-    st.info(
-        """
-        Paste recipe URLs from websites you have permission to scrape.
-        The app extracts structured recipe information and then uses
-        Gemini only for normalization/interpretation.
-        """
-    )
+        st.error(
+            "Gemini API key is missing."
+        )
 
-    url = st.text_input(
-        "Recipe URL",
-        placeholder="https://example.com/recipe",
-    )
+    elif not region.strip():
 
-    col_a, col_b = st.columns([1, 1])
-
-    with col_a:
-        if st.button(
-            "🔎 Scrape & Extract Recipe",
-            type="primary",
-            use_container_width=True,
-        ):
-
-            if not url:
-                st.error("Please enter a recipe URL.")
-
-            elif not gemini_available():
-                st.error("Configure your Gemini API key first.")
-
-            else:
-                try:
-                    with st.spinner(
-                        "Scraping webpage and extracting recipe..."
-                    ):
-                        scraped = scrape_recipe_url(url)
-                        recipe = extract_recipe_with_ai(scraped)
-
-                    st.session_state.recipes.append(recipe)
-
-                    st.success(
-                        f"Recipe extracted: {recipe.title}"
-                    )
-
-                except Exception as e:
-                    st.error(
-                        f"Could not process recipe: {e}"
-                    )
-
-    with col_b:
-        if st.button(
-            "🧹 Clear recipes",
-            use_container_width=True,
-        ):
-            st.session_state.recipes = []
-            st.session_state.adapted_recipes = []
-            st.rerun()
-
-    st.divider()
-
-    if st.session_state.recipes:
-
-        st.subheader("Collected recipes")
-
-        for i, recipe in enumerate(
-            st.session_state.recipes
-        ):
-
-            with st.expander(
-                f"{i + 1}. {recipe.title}"
-            ):
-
-                st.write(
-                    recipe.description
-                )
-
-                c1, c2, c3 = st.columns(3)
-
-                c1.metric(
-                    "Prep",
-                    f"{recipe.prep_time_minutes} min",
-                )
-
-                c2.metric(
-                    "Cook",
-                    f"{recipe.cook_time_minutes} min",
-                )
-
-                c3.metric(
-                    "Servings",
-                    recipe.servings,
-                )
-
-                st.markdown("### Ingredients")
-
-                for ingredient in recipe.ingredients:
-                    st.write(
-                        f"• **{ingredient.quantity}** "
-                        f"{ingredient.name} "
-                        f"{ingredient.notes or ''}"
-                    )
-
-                st.markdown("### Method")
-
-                for step_no, step in enumerate(
-                    recipe.instructions,
-                    1,
-                ):
-                    st.write(
-                        f"{step_no}. {step}"
-                    )
-
-
-# ============================================================
-# INDIANIZE
-# ============================================================
-
-with tab2:
-
-    st.header("🇮🇳 Convert to Indian Palate")
-
-    if not st.session_state.recipes:
-
-        st.info(
-            "First collect at least one recipe in the Discover tab."
+        st.error(
+            "Please enter a region, city or culinary area."
         )
 
     else:
 
-        recipe_names = [
-            r.title
-            for r in st.session_state.recipes
-        ]
+        try:
 
-        selected_index = st.selectbox(
-            "Select recipe",
-            range(len(recipe_names)),
-            format_func=lambda x: recipe_names[x],
-        )
+            (
+                research,
+                originals,
+                adapted,
+            ) = run_full_pipeline(
+                country=country,
+                region=region,
+                category=category,
+                target_indian_region=target_indian_region,
+                flavour_profile=flavour_profile,
+                spice=spice,
+                tang=tang,
+                sweet=sweet,
+                salt=salt,
+                richness=richness,
+                smoke=smoke,
+                vegetarian=vegetarian,
+                vegan=vegan,
+                jain=jain,
+                street_food=street_food,
+            )
 
-        selected_recipe = st.session_state.recipes[
-            selected_index
-        ]
+            st.session_state.last_research = research
 
-        st.markdown(
-            f"""
-### Selected recipe
+            st.session_state.last_original_recipes = originals
 
-**{selected_recipe.title}**
+            st.session_state.last_adapted = adapted
 
-Source:
-`{selected_recipe.source_url or "Unknown"}`
-"""
-        )
+        except Exception as e:
 
-        st.markdown(
-            f"""
-<div class="recipe-card">
+            st.error(
+                "The research pipeline encountered an error."
+            )
 
-<strong>Target:</strong> {target_region}<br>
-<strong>Flavour:</strong> {flavour_profile}<br>
-<strong>Spice:</strong> {spice_level}/10<br>
-<strong>Tang:</strong> {tanginess}/10<br>
-<strong>Sweet:</strong> {sweetness}/10<br>
-<strong>Richness:</strong> {richness}/10<br>
-<strong>Smoke:</strong> {smokiness}/10
+            with st.expander(
+                "Technical error"
+            ):
+                st.exception(e)
+
+
+# ============================================================
+# RESULTS
+# ============================================================
+
+if st.session_state.last_adapted:
+
+    adapted_result = (
+        st.session_state.last_adapted
+    )
+
+    research_result = (
+        st.session_state.last_research
+    )
+
+    original_recipes = (
+        st.session_state.last_original_recipes
+    )
+
+    st.divider()
+
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    st.header(
+        "📊 Research Summary"
+    )
+
+    st.markdown(
+        f"""
+<div class="success-box">
+
+<strong>Research target:</strong>
+{country} → {region}
+
+<br><br>
+
+<strong>Indian target:</strong>
+{target_indian_region}
+
+<br><br>
+
+<strong>Recipes researched:</strong>
+{len(research_result.sources)}
+
+<br>
+
+<strong>Recipes successfully extracted:</strong>
+{len(original_recipes)}
+
+<br>
+
+<strong>Indian concepts created:</strong>
+{len(adapted_result.recipes)}
 
 </div>
 """,
-            unsafe_allow_html=True,
-        )
+        unsafe_allow_html=True,
+    )
 
-        if st.button(
-            "🌶️ Convert recipe",
-            type="primary",
-            use_container_width=True,
-        ):
+    st.write(
+        adapted_result.research_summary
+    )
 
-            if not gemini_available():
-                st.error(
-                    "Configure Gemini API first."
-                )
+    # --------------------------------------------------------
+    # RESEARCH SOURCES
+    # --------------------------------------------------------
 
-            else:
+    with st.expander(
+        "🌐 View AI research sources"
+    ):
 
-                try:
+        for source in research_result.sources:
 
-                    with st.spinner(
-                        "Chef AI is developing the Indian version..."
-                    ):
-
-                        adapted = adapt_recipe(
-                            selected_recipe,
-                            target_region,
-                            flavour_profile,
-                            spice_level,
-                            tanginess,
-                            sweetness,
-                            saltiness,
-                            richness,
-                            smokiness,
-                            vegetarian,
-                            vegan,
-                            jain,
-                            street_food,
-                        )
-
-                    # Replace previous adaptation for same source.
-                    st.session_state.adapted_recipes = [
-                        r
-                        for r in st.session_state.adapted_recipes
-                        if r.source_url
-                        != adapted.source_url
-                    ]
-
-                    st.session_state.adapted_recipes.append(
-                        adapted
-                    )
-
-                    st.success(
-                        f"Created: {adapted.indian_name}"
-                    )
-
-                except Exception as e:
-                    st.error(
-                        f"Adaptation failed: {e}"
-                    )
-
-        if st.session_state.adapted_recipes:
-
-            adapted = st.session_state.adapted_recipes[-1]
-
-            st.divider()
-
-            st.subheader(
-                f"🍽️ {adapted.indian_name}"
-            )
-
-            c1, c2, c3, c4 = st.columns(4)
-
-            c1.metric(
-                "Street Food Score",
-                f"{adapted.street_food_score}/10",
-            )
-
-            c2.metric(
-                "Commercial Score",
-                f"{adapted.commercial_score}/10",
-            )
-
-            c3.metric(
-                "Estimated Food Cost",
-                (
-                    f"₹{adapted.estimated_food_cost_inr:.0f}"
-                    if adapted.estimated_food_cost_inr
-                    else "N/A"
-                ),
-            )
-
-            c4.metric(
-                "Suggested Price",
-                (
-                    f"₹{adapted.suggested_selling_price_inr:.0f}"
-                    if adapted.suggested_selling_price_inr
-                    else "N/A"
-                ),
+            total_score = (
+                source.source_quality
+                + source.recipe_completeness
+                + source.regional_authenticity
+                + source.indian_adaptation_potential
             )
 
             st.markdown(
                 f"""
-<div class="success">
+<div class="source-card">
 
-<strong>Indian positioning</strong><br>
+<h4>{source.title}</h4>
 
-Target region: {adapted.target_indian_region}<br>
-Flavour direction: {adapted.flavour_profile}
+<strong>Source:</strong>
+<a href="{source.url}" target="_blank">
+{source.url}
+</a>
+
+<br><br>
+
+<strong>Quality:</strong>
+{source.source_quality}/10
+
+&nbsp;&nbsp;
+
+<strong>Completeness:</strong>
+{source.recipe_completeness}/10
+
+&nbsp;&nbsp;
+
+<strong>Regional:</strong>
+{source.regional_authenticity}/10
+
+&nbsp;&nbsp;
+
+<strong>Indian potential:</strong>
+{source.indian_adaptation_potential}/10
+
+<br><br>
+
+{source.why_relevant}
 
 </div>
 """,
                 unsafe_allow_html=True,
             )
 
-            st.markdown("### 🧂 Ingredients")
+    # --------------------------------------------------------
+    # BUSINESS DASHBOARD
+    # --------------------------------------------------------
 
-            for ingredient in adapted.ingredients:
+    st.header(
+        "🏪 Restaurant R&D Dashboard"
+    )
 
-                notes = (
-                    f" — {ingredient.notes}"
-                    if ingredient.notes
-                    else ""
-                )
+    if adapted_result.recipes:
+
+        scores = [
+            business_score(r)
+            for r in adapted_result.recipes
+        ]
+
+        avg_score = (
+            sum(scores)
+            / len(scores)
+        )
+
+        best_score = max(scores)
+
+        avg_costs = [
+            r.estimated_food_cost_inr
+            for r in adapted_result.recipes
+            if r.estimated_food_cost_inr
+        ]
+
+        avg_cost = (
+            sum(avg_costs)
+            / len(avg_costs)
+            if avg_costs
+            else 0
+        )
+
+        c1, c2, c3, c4 = st.columns(4)
+
+        c1.metric(
+            "Concepts",
+            len(adapted_result.recipes),
+        )
+
+        c2.metric(
+            "Avg business score",
+            f"{avg_score:.0f}/100",
+        )
+
+        c3.metric(
+            "Best score",
+            f"{best_score:.0f}/100",
+        )
+
+        c4.metric(
+            "Avg food cost",
+            f"₹{avg_cost:.0f}",
+        )
+
+    # --------------------------------------------------------
+    # SORT RECIPES
+    # --------------------------------------------------------
+
+    ranked = sorted(
+        adapted_result.recipes,
+        key=business_score,
+        reverse=True,
+    )
+
+    st.header(
+        "🍽️ Indian Street-Food Concepts"
+    )
+
+    # --------------------------------------------------------
+    # RECIPE CARDS
+    # --------------------------------------------------------
+
+    for index, recipe in enumerate(
+        ranked,
+        1,
+    ):
+
+        score = business_score(
+            recipe
+        )
+
+        with st.container():
+
+            st.markdown(
+                '<div class="recipe-card">',
+                unsafe_allow_html=True,
+            )
+
+            st.markdown(
+                f"""
+## {index}. {recipe.indian_name}
+
+**Original:** {recipe.original_title}
+
+**Source:**
+<a href="{recipe.source_url}" target="_blank">
+Open original source
+</a>
+""",
+                unsafe_allow_html=True,
+            )
+
+            c1, c2, c3, c4, c5 = st.columns(5)
+
+            c1.metric(
+                "Business",
+                f"{score:.0f}/100",
+            )
+
+            c2.metric(
+                "Street Food",
+                f"{recipe.street_food_score}/10",
+            )
+
+            c3.metric(
+                "Commercial",
+                f"{recipe.commercial_score}/10",
+            )
+
+            c4.metric(
+                "Food Cost",
+                f"₹{recipe.estimated_food_cost_inr:.0f}",
+            )
+
+            c5.metric(
+                "Suggested Price",
+                f"₹{recipe.suggested_selling_price_inr:.0f}",
+            )
+
+            st.markdown(
+                f"""
+**Indian positioning**
+
+{recipe.menu_positioning}
+
+**Description**
+
+{recipe.description}
+"""
+            )
+
+            st.markdown(
+                "### 🎚️ Flavour fingerprint"
+            )
+
+            flavour_cols = st.columns(
+                6
+            )
+
+            flavour_values = [
+                (
+                    "🌶️",
+                    "Spice",
+                    recipe.spice_level,
+                ),
+                (
+                    "🍋",
+                    "Tang",
+                    recipe.tanginess,
+                ),
+                (
+                    "🍬",
+                    "Sweet",
+                    recipe.sweetness,
+                ),
+                (
+                    "🧂",
+                    "Salt",
+                    recipe.saltiness,
+                ),
+                (
+                    "🥛",
+                    "Rich",
+                    recipe.richness,
+                ),
+                (
+                    "🔥",
+                    "Smoke",
+                    recipe.smokiness,
+                ),
+            ]
+
+            for col, (
+                icon,
+                label,
+                value,
+            ) in zip(
+                flavour_cols,
+                flavour_values,
+            ):
+
+                with col:
+
+                    st.metric(
+                        f"{icon} {label}",
+                        f"{value}/10",
+                    )
+
+            st.markdown(
+                "### 🧂 Ingredients"
+            )
+
+            for ingredient in (
+                recipe.ingredients
+            ):
+
+                notes = ""
+
+                if ingredient.notes:
+                    notes = (
+                        f" — {ingredient.notes}"
+                    )
 
                 st.write(
                     f"• **{ingredient.quantity}** "
-                    f"{ingredient.name}{notes}"
+                    f"{ingredient.name}"
+                    f"{notes}"
                 )
 
-            st.markdown("### 👨‍🍳 Preparation")
+            st.markdown(
+                "### 👨‍🍳 Preparation"
+            )
 
             for i, step in enumerate(
-                adapted.instructions,
+                recipe.instructions,
                 1,
             ):
+
                 st.write(
-                    f"{i}. {step}"
+                    f"**{i}.** {step}"
                 )
 
-            st.markdown(
-                "### 🔄 Key Indian adaptations"
-            )
+            if recipe.accompaniments:
 
-            for item in adapted.indian_adaptation_notes:
-                st.write(f"• {item}")
-
-            st.markdown(
-                "### 🔁 Ingredient substitutions"
-            )
-
-            for item in adapted.substitutions:
-                st.write(f"• {item}")
-
-            st.markdown(
-                "### 🥣 Serving & accompaniments"
-            )
-
-            for item in adapted.plating_and_serving:
-                st.write(f"• {item}")
-
-            st.markdown(
-                "### 🏪 Batch production"
-            )
-
-            for item in adapted.batch_production_notes:
-                st.write(f"• {item}")
-
-
-# ============================================================
-# R&D LAB
-# ============================================================
-
-with tab3:
-
-    st.header("📊 Restaurant R&D Lab")
-
-    if not st.session_state.adapted_recipes:
-
-        st.info(
-            "Create Indian adaptations first."
-        )
-
-    else:
-
-        data = []
-
-        for recipe in st.session_state.adapted_recipes:
-
-            business_score = calculate_business_score(
-                recipe
-            )
-
-            data.append(
-                {
-                    "Recipe": recipe.indian_name,
-                    "Region": recipe.target_indian_region,
-                    "Street Food": recipe.street_food_score,
-                    "Commercial": recipe.commercial_score,
-                    "Business Score": business_score,
-                    "Cost ₹": recipe.estimated_food_cost_inr,
-                    "Price ₹": recipe.suggested_selling_price_inr,
-                }
-            )
-
-        st.dataframe(
-            data,
-            use_container_width=True,
-        )
-
-        st.divider()
-
-        st.subheader(
-            "💡 AI product-development questions"
-        )
-
-        question = st.text_area(
-            "Ask the AI about your recipe portfolio",
-            placeholder=(
-                "Which of these recipes is most suitable "
-                "for a Bengaluru street-food stall?"
-            ),
-        )
-
-        if st.button(
-            "Ask R&D AI",
-            use_container_width=True,
-        ):
-
-            if not gemini_available():
-                st.error(
-                    "Configure Gemini API first."
+                st.markdown(
+                    "### 🥣 Accompaniments"
                 )
 
-            elif not question:
-                st.warning(
-                    "Enter a question."
-                )
+                for item in (
+                    recipe.accompaniments
+                ):
 
-            else:
-
-                portfolio = json.dumps(
-                    [
-                        r.model_dump()
-                        for r in st.session_state.adapted_recipes
-                    ],
-                    indent=2,
-                    ensure_ascii=False,
-                )
-
-                prompt = f"""
-You are a restaurant strategy and food R&D consultant.
-
-Here is the current recipe portfolio:
-
-{portfolio[:30000]}
-
-Answer this question:
-
-{question}
-
-Focus on:
-- Indian customer appeal
-- street-food practicality
-- speed of service
-- food cost
-- ingredient availability
-- consistency
-- differentiation
-- scalability
-- menu engineering
-
-Be practical rather than theoretical.
-"""
-
-                try:
-
-                    with st.spinner(
-                        "Analysing recipe portfolio..."
-                    ):
-
-                        client = get_gemini_client()
-
-                        response = client.models.generate_content(
-                            model=DEFAULT_MODEL,
-                            contents=prompt,
-                        )
-
-                    st.markdown(response.text)
-
-                except Exception as e:
-                    st.error(str(e))
-
-
-# ============================================================
-# EXPORT
-# ============================================================
-
-with tab4:
-
-    st.header("💾 Export Recipe R&D")
-
-    if not st.session_state.adapted_recipes:
-
-        st.info(
-            "There are no adapted recipes to export."
-        )
-
-    else:
-
-        for i, recipe in enumerate(
-            st.session_state.adapted_recipes
-        ):
-
-            recipe_json = json.dumps(
-                recipe.model_dump(),
-                indent=2,
-                ensure_ascii=False,
-            )
-
-            st.download_button(
-                label=f"⬇️ Download {recipe.indian_name}",
-                data=recipe_json,
-                file_name=(
-                    re.sub(
-                        r"[^a-zA-Z0-9_-]",
-                        "_",
-                        recipe.indian_name,
+                    st.write(
+                        f"• {item}"
                     )
-                    + ".json"
-                ),
-                mime="application/json",
-                key=f"download_{i}",
-                use_container_width=True,
+
+            if recipe.substitutions:
+
+                st.markdown(
+                    "### 🔄 Indian substitutions"
+                )
+
+                for item in (
+                    recipe.substitutions
+                ):
+
+                    st.write(
+                        f"• {item}"
+                    )
+
+            if recipe.adaptation_notes:
+
+                st.markdown(
+                    "### 🇮🇳 Why this works for the Indian palate"
+                )
+
+                for item in (
+                    recipe.adaptation_notes
+                ):
+
+                    st.write(
+                        f"• {item}"
+                    )
+
+            if recipe.batch_production_notes:
+
+                st.markdown(
+                    "### 🏪 Restaurant batch production"
+                )
+
+                for item in (
+                    recipe.batch_production_notes
+                ):
+
+                    st.write(
+                        f"• {item}"
+                    )
+
+            st.markdown(
+                "</div>",
+                unsafe_allow_html=True,
             )
 
-            with st.expander(
-                f"View JSON — {recipe.indian_name}"
-            ):
-                st.code(
-                    recipe_json,
-                    language="json",
-                )
+    # --------------------------------------------------------
+    # EXPORT
+    # --------------------------------------------------------
+
+    st.divider()
+
+    st.header(
+        "💾 Export R&D Results"
+    )
+
+    export_data = json.dumps(
+        [
+            recipe.model_dump()
+            for recipe in ranked
+        ],
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    st.download_button(
+        label="⬇️ Download all generated recipes",
+        data=export_data,
+        file_name="masalaatlas_rnd_results.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+
+# ============================================================
+# EMPTY STATE
+# ============================================================
+
+else:
+
+    st.divider()
+
+    st.markdown(
+        """
+### How it works
+
+**1. Choose the food world**
+
+Pick a country, region and food category.
+
+**2. Choose your Indian target**
+
+Tell the AI which Indian market or regional palate
+you want to target.
+
+**3. Tune the flavour**
+
+Adjust spice, tang, sweetness, salt, richness
+and smokiness.
+
+**4. Press one button**
+
+The AI researches the web, finds promising recipes,
+extracts them and creates Indian street-food concepts.
+
+**5. Evaluate the business**
+
+Each concept receives a street-food score,
+commercial score, estimated food cost and
+suggested selling price.
+"""
+    )
 
 
 # ============================================================
@@ -1284,11 +2072,12 @@ st.divider()
 
 st.caption(
     """
-MasalaAtlas AI — Global recipe intelligence for Indian food R&D.
+MasalaAtlas AI · Global culinary research and Indian
+street-food R&D.
 
-Use recipe websites in accordance with their terms, robots policies,
-copyright/licensing requirements and applicable law. This application
-does not bypass authentication, paywalls, anti-bot systems or access
-controls.
+Recipe sources are used for research. Respect the
+source websites' terms, robots policies, copyright,
+licensing requirements and applicable law. The app
+does not bypass authentication, paywalls or access controls.
 """
 )
